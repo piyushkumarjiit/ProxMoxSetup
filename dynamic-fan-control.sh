@@ -1,24 +1,14 @@
+#!/bin/bash
 # -------------------------------------------------------------------------
 # FILE: dynamic-fan-control.sh
-# ROLE: Active Proxmox Thermal Monitor
-#
-# DESCRIPTION:
-# Monitors temperatures across all hardware tiers and adjusts server 
-# fan speeds via IPMI. Dynamically scales fan curves based on the 
-# hottest component (CPU, GPU, NVMe, or HDD) to prevent thermal throttling.
-#
-# HARDWARE COMPATIBILITY:
-# - Targets Dell PowerEdge iDRAC (IPMI over LAN).
-# - Requires ipmitool, smartmontools, and nvme-cli.
+# ROLE: Multi-Tier Thermal Monitor (PVE Host)
 # -------------------------------------------------------------------------
 
-#!/bin/bash
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# (Your local IDRAC details go here. Default values populated)
-IDRAC_IP="192.168.XX.XX"
-IDRAC_USER="root" # default login, change to yours
-IDRAC_PASS="calvin" # default passwd, change to yours
+IDRAC_IP="192.168.2.56"
+IDRAC_USER="root"
+IDRAC_PASS="calvin"
 
 # Thermal Thresholds
 CPU_MAX=75
@@ -99,12 +89,19 @@ if (( $(echo "$MAX_LOAD >= 1.0" | bc -l) )); then
     ipmitool -I lanplus -H $IDRAC_IP -U $IDRAC_USER -P $IDRAC_PASS -C 3 raw 0x30 0x30 0x01 0x01
     SPEED="MAX"
 elif (( $(echo "$MAX_LOAD >= 0.8" | bc -l) )); then
-    SPEED="0x3c"
+    # High: 80% Speed (80 in hex is 0x50)
+    SPEED="0x50"
 elif (( $(echo "$MAX_LOAD >= 0.6" | bc -l) )); then
-    SPEED="0x28"
+    # Medium: 65% Speed (65 in hex is 0x41)
+    SPEED="0x41"
 elif (( $(echo "$MAX_LOAD >= 0.4" | bc -l) )); then
-    SPEED="0x19"
+    # Low: 40% Speed (40 in hex is 0x28)
+    SPEED="0x28"
+elif (( $(echo "$MAX_LOAD >= 0.2" | bc -l) )); then
+    # Quiet: 20% Speed (20 in hex is 0x14)
+    SPEED="0x14"
 else
+    # Very Quiet: 10% Speed (10 in hex is 0x0a)
     SPEED="0x0a"
 fi
 
