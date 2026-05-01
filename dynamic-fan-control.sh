@@ -1,9 +1,35 @@
 #!/bin/bash
+#!/bin/bash
 # -------------------------------------------------------------------------
 # FILE: dynamic-fan-control.sh
-# ROLE: Multi-Tier Thermal Monitor (PVE Host)
+# ROLE: Multi-Tier Thermal Monitor & Dynamic Fan Controller (Proxmox Host)
 # -------------------------------------------------------------------------
-
+# DESCRIPTION:
+# Manages Dell PowerEdge thermal profiles by interfacing with the iDRAC 
+# via IPMI. This script implements a hybrid cooling logic that balances 
+# silent operation during idle states with aggressive, linear scaling 
+# during high-load AI workloads (RAG/Object Tracking).
+#
+# FEATURES:
+# - Multi-Source Sensing: Aggregates temps from CPU, GPU (VM Passthrough), 
+#   NVMe (Host JSON), and Chassis Exhaust.
+# - Hybrid Logic: Stepped duty cycles for idle (10%, 25%) and 1:1 linear 
+#   scaling for loads > 40%.
+# - Smart NVMe Handling: Implements Kelvin-to-Celsius conversion and a 
+#   low-temp "floor" to prevent drive-idling fan noise.
+# - Clean Reporting: Real-time status output with human-readable 
+#   percentages and raw hex values.
+#
+# UPDATES:
+# - Replaced fixed speed tiers with a dynamic 1:1 Load-to-Fan% scaling 
+#   for loads above 40%.
+# - Switched NVMe sensing to host-level JSON parsing to bypass Guest 
+#   Agent inconsistencies.
+# - Implemented stderr/stdout suppression for IPMI calls to ensure 
+#   clean terminal logging.
+# - Adjusted base "Quiet" speed from 20% to 25% for improved static 
+#   pressure on HDDs.
+# -------------------------------------------------------------------------
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 IDRAC_IP="192.168.2.56"
@@ -12,7 +38,7 @@ IDRAC_PASS="calvin"
 
 # Thermal Thresholds
 CPU_MAX=75
-GPU_MAX=80
+GPU_MAX=75
 HDD_MAX=75
 NVME_MAX=70
 EXHAUST_MAX=70
@@ -114,49 +140,39 @@ else
     NVME_LOAD=$(echo "scale=2; $NVME_T / $NVME_MAX" | bc)
 fi
 
+# --- 6. CALCULATE LOAD & SET SPEED ---
+
 # Find the highest load among all components
 MAX_LOAD=$(echo -e "$CPU_LOAD\n$GPU_LOAD\n$HDD_LOAD\n$NVME_LOAD\n$EXHAUST_LOAD" | sort -rn | head -1)
 
 # Set manual control mode (0x00)
-ipmitool -I lanplus -H $IDRAC_IP -U $IDRAC_USER -P $IDRAC_PASS -C 3 raw 0x30 0x30 0x01 0x00
+ipmitool -I lanplus -H $IDRAC_IP -U $IDRAC_USER -P $IDRAC_PASS -C 3 raw 0x30 0x30 0x01 0x00 > /dev/null 2>&1
 
-if (( $(echo "$MAX_LOAD >= 1.0" | bc -l) )); then
-    # FORCED 100% Speed: Keep manual control (0x00) and set speed to 100% (0x64)
-    ipmitool -I lanplus -H $IDRAC_IP -U $IDRAC_USER -P $IDRAC_PASS -C 3 raw 0x30 0x30 0x01 0x00
-    SPEED="0x64"
-elif (( $(echo "$MAX_LOAD >= 0.8" | bc -l) )); then
-    # High: 80% Speed (80 in hex is 0x50)
-    SPEED="0x50"
-elif (( $(echo "$MAX_LOAD >= 0.6" | bc -l) )); then
-    # Medium: 65% Speed (65 in hex is 0x41)
-    SPEED="0x41"
-elif (( $(echo "$MAX_LOAD >= 0.4" | bc -l) )); then
-    # Low: 40% Speed (40 in hex is 0x28)
-    SPEED="0x28"
-elif (( $(echo "$MAX_LOAD >= 0.2" | bc -l) )); then
-    # Quiet: 25% Speed (20 in hex is 0x19)
+if (( $(echo "$MAX_LOAD < 0.2" | bc -l) )); then
+    # Very Quiet: 10%
+    DISPLAY_PERC="10%"
+    SPEED="0x0a"
+elif (( $(echo "$MAX_LOAD < 0.4" | bc -l) )); then
+    # Quiet: 25% (Base speed)
+    DISPLAY_PERC="25%"
     SPEED="0x19"
 else
-    # Very Quiet: 10% Speed (10 in hex is 0x0a)
-    SPEED="0x0a"
+    # DYNAMIC SCALING: Above 40% load, fan speed = load percentage
+    # Example: 0.56 load = 56% fan speed
+    CALC_PERC=$(echo "scale=0; ($MAX_LOAD * 100) / 1" | bc)
+    
+    # Cap at 100%
+    if [ "$CALC_PERC" -gt 100 ]; then CALC_PERC=100; fi
+    
+    DISPLAY_PERC="${CALC_PERC}%"
+    # Convert decimal percentage to Hex for IPMI (e.g., 56 -> 0x38)
+    SPEED=$(printf '0x%02x' $CALC_PERC)
 fi
 
 if [ -n "$SPEED" ]; then
-    ipmitool -I lanplus -H $IDRAC_IP -U $IDRAC_USER -P $IDRAC_PASS -C 3 raw 0x30 0x30 0x02 0xff $SPEED
+    ipmitool -I lanplus -H $IDRAC_IP -U $IDRAC_USER -P $IDRAC_PASS -C 3 raw 0x30 0x30 0x02 0xff $SPEED > /dev/null 2>&1
 fi
 
-# --- 7. HUMAN READABLE OUTPUT ---
-case $SPEED in
-    "0x64")  DISPLAY_PERC="100%" ;;
-    "0x50")  DISPLAY_PERC="80%" ;;
-    "0x41")  DISPLAY_PERC="65%" ;;
-    "0x28")  DISPLAY_PERC="40%" ;;
-	"0x19")  DISPLAY_PERC="25%" ;;
-    "0x14")  DISPLAY_PERC="20%" ;;
-    "0x0a")  DISPLAY_PERC="10%" ;;
-    "MAX")   DISPLAY_PERC="AUTO/100%" ;;
-    *)       DISPLAY_PERC="UNKNOWN" ;;
-esac
-
+# --- 7. OUTPUT ---
 echo -e "Load Status: CPU: $CPU_LOAD GPU: $GPU_LOAD HDD: $HDD_LOAD NVME: $NVME_LOAD Exhaust: $EXHAUST_LOAD"
 echo "Status: CPU:${CPU_T}°C GPU:${GPU_T}°C HDD:${HDD_T}°C NVMe:${NVME_T}°C EXHAUST:${EXHAUST_T}°C | LOAD:$MAX_LOAD | FAN SPEED: $DISPLAY_PERC ($SPEED)"
