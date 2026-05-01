@@ -32,8 +32,9 @@
 # -------------------------------------------------------------------------
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
+# Default values. Please update with your env details below.
 IDRAC_IP="192.168.2.56"
-IDRAC_USER="root"
+IDRAC_USER="root" 
 IDRAC_PASS="calvin"
 
 # Thermal Thresholds
