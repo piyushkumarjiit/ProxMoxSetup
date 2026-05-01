@@ -13,9 +13,9 @@ IDRAC_PASS="calvin"
 # Thermal Thresholds
 CPU_MAX=75
 GPU_MAX=80
-HDD_MAX=50
-NVME_MAX=60
-EXHAUST_MAX=55
+HDD_MAX=75
+NVME_MAX=70
+EXHAUST_MAX=70
 
 # --- 1. GET SYSTEM TEMPS (IPMI) ---
 # Fetching directly from the iDRAC
@@ -39,30 +39,58 @@ for VMID in $GPU_VMS; do
         VM_GPUS=$(qm guest exec $VMID -- nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null | grep "out-data" | awk -F': ' '{print $2}' | sed 's/[^0-9]//g')
         for T in $VM_GPUS; do [ -n "$T" ] && [ "$T" -gt "$MAX_GPU_T" ] && MAX_GPU_T=$T; done
 
-        # Query NVMe (assumes /dev/nvme0)
-        VM_NVMES=$(qm guest exec $VMID -- nvme smart-log /dev/nvme0 2>/dev/null | grep "temperature" | awk '{print $3}' | sed 's/[^0-9]//g')
-        for T in $VM_NVMES; do [ -n "$T" ] && [ "$T" -gt "$MAX_NVME_T" ] && MAX_NVME_T=$T; done
+    fi
+done
+
+# --- 2. GET NVME TEMPS (HOST LEVEL) ---
+MAX_NVME_T=0
+for nvme in $(ls /dev/nvme[0-9] 2>/dev/null); do
+    # Get the clean Kelvin value from JSON
+    K_VAL=$(nvme smart-log $nvme -o json 2>/dev/null | grep "temperature" | head -1 | sed 's/[^0-9]//g')
+    
+    if [ -n "$K_VAL" ] && [ "$K_VAL" -gt 273 ]; then
+        # Convert Kelvin to Celsius
+        T=$((K_VAL - 273))
+    else
+        T=0
+    fi
+
+    if [ -n "$T" ] && [ "$T" -gt "$MAX_NVME_T" ]; then
+        MAX_NVME_T=$T
     fi
 done
 
 # --- 3. GET HDD TEMPS (LOCAL) ---
-MAX_HDD_T=0
+#MAX_HDD_T=0
+TOTAL_HDD_T=0
+DRIVE_COUNT=0
+
 for drive in $(lsblk -dn -o NAME | grep -E 'sd|vd'); do
-    T=$(smartctl -a /dev/$drive 2>/dev/null | grep -i "Temperature_Celsius" | awk '{print $10}' | sed 's/[^0-9]//g')
-    if [ -n "$T" ] && [ "$T" -gt "$MAX_HDD_T" ]; then
-        MAX_HDD_T=$T
+    T=$(smartctl -a /dev/$drive 2>/dev/null | grep -iE "Temperature_Celsius|Airflow_Temperature_Cel" | awk '{print $10}' | sed 's/[^0-9]//g')
+    
+    if [ -n "$T" ] && [ "$T" -gt 0 ]; then
+        TOTAL_HDD_T=$((TOTAL_HDD_T + T))
+        DRIVE_COUNT=$((DRIVE_COUNT + 1))
     fi
 done
 
+# Calculate Average (handle division by zero)
+if [ "$DRIVE_COUNT" -gt 0 ]; then
+    HDD_T=$((TOTAL_HDD_T / DRIVE_COUNT))
+else
+    HDD_T=0
+fi
+
 # --- 4. CONSOLIDATE RESULTS ---
-HDD_T=${MAX_HDD_T:-0}
+#HDD_T=${MAX_HDD_T:-0}
 NVME_T=${MAX_NVME_T:-0}
 
 # GPU Fallback logic
 if [ "$MAX_GPU_T" -gt 0 ]; then
     GPU_T=$MAX_GPU_T
 else
-    GPU_T=$(echo "$EXHAUST_T + 15" | bc)
+	#echo "Using fallback logic."
+    GPU_T=$(echo "$EXHAUST_T + 5" | bc)
 fi
 
 # --- 5. SAFETY GATE ---
@@ -76,18 +104,26 @@ fi
 CPU_LOAD=$(echo "scale=2; $CPU_T / $CPU_MAX" | bc)
 GPU_LOAD=$(echo "scale=2; $GPU_T / $GPU_MAX" | bc)
 HDD_LOAD=$(echo "scale=2; $HDD_T / $HDD_MAX" | bc)
-NVME_LOAD=$(echo "scale=2; $NVME_T / $NVME_MAX" | bc)
 EXHAUST_LOAD=$(echo "scale=2; $EXHAUST_T / $EXHAUST_MAX" | bc)
 
+# NVMe Conditional Logic: 
+# If below 45°C, cap the load impact to 0.20 (Quiet tier).
+if [ "$NVME_T" -lt 45 ]; then
+    NVME_LOAD=0.20
+else
+    NVME_LOAD=$(echo "scale=2; $NVME_T / $NVME_MAX" | bc)
+fi
+
+# Find the highest load among all components
 MAX_LOAD=$(echo -e "$CPU_LOAD\n$GPU_LOAD\n$HDD_LOAD\n$NVME_LOAD\n$EXHAUST_LOAD" | sort -rn | head -1)
 
 # Set manual control mode (0x00)
 ipmitool -I lanplus -H $IDRAC_IP -U $IDRAC_USER -P $IDRAC_PASS -C 3 raw 0x30 0x30 0x01 0x00
 
 if (( $(echo "$MAX_LOAD >= 1.0" | bc -l) )); then
-    # Emergency: Revert to iDRAC Auto
-    ipmitool -I lanplus -H $IDRAC_IP -U $IDRAC_USER -P $IDRAC_PASS -C 3 raw 0x30 0x30 0x01 0x01
-    SPEED="MAX"
+    # FORCED 100% Speed: Keep manual control (0x00) and set speed to 100% (0x64)
+    ipmitool -I lanplus -H $IDRAC_IP -U $IDRAC_USER -P $IDRAC_PASS -C 3 raw 0x30 0x30 0x01 0x00
+    SPEED="0x64"
 elif (( $(echo "$MAX_LOAD >= 0.8" | bc -l) )); then
     # High: 80% Speed (80 in hex is 0x50)
     SPEED="0x50"
@@ -98,15 +134,29 @@ elif (( $(echo "$MAX_LOAD >= 0.4" | bc -l) )); then
     # Low: 40% Speed (40 in hex is 0x28)
     SPEED="0x28"
 elif (( $(echo "$MAX_LOAD >= 0.2" | bc -l) )); then
-    # Quiet: 20% Speed (20 in hex is 0x14)
-    SPEED="0x14"
+    # Quiet: 25% Speed (20 in hex is 0x19)
+    SPEED="0x19"
 else
     # Very Quiet: 10% Speed (10 in hex is 0x0a)
     SPEED="0x0a"
 fi
 
-if [ "$SPEED" != "MAX" ]; then
+if [ -n "$SPEED" ]; then
     ipmitool -I lanplus -H $IDRAC_IP -U $IDRAC_USER -P $IDRAC_PASS -C 3 raw 0x30 0x30 0x02 0xff $SPEED
 fi
 
-echo "Status: CPU:$CPU_T GPU:$GPU_T HDD:$HDD_T NVMe:$NVME_T | LOAD:$MAX_LOAD | SPEED:$SPEED"
+# --- 7. HUMAN READABLE OUTPUT ---
+case $SPEED in
+    "0x64")  DISPLAY_PERC="100%" ;;
+    "0x50")  DISPLAY_PERC="80%" ;;
+    "0x41")  DISPLAY_PERC="65%" ;;
+    "0x28")  DISPLAY_PERC="40%" ;;
+	"0x19")  DISPLAY_PERC="25%" ;;
+    "0x14")  DISPLAY_PERC="20%" ;;
+    "0x0a")  DISPLAY_PERC="10%" ;;
+    "MAX")   DISPLAY_PERC="AUTO/100%" ;;
+    *)       DISPLAY_PERC="UNKNOWN" ;;
+esac
+
+echo -e "Load Status: CPU: $CPU_LOAD GPU: $GPU_LOAD HDD: $HDD_LOAD NVME: $NVME_LOAD Exhaust: $EXHAUST_LOAD"
+echo "Status: CPU:${CPU_T}°C GPU:${GPU_T}°C HDD:${HDD_T}°C NVMe:${NVME_T}°C EXHAUST:${EXHAUST_T}°C | LOAD:$MAX_LOAD | FAN SPEED: $DISPLAY_PERC ($SPEED)"
