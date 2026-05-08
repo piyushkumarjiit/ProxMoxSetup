@@ -1,7 +1,7 @@
 #!/bin/bash
 # -------------------------------------------------------------------------
 # FILE: create-cip-infra.sh (Target ID 106)
-# ROLE: CIP Platform Infrastructure with Immutable Audit Ledger
+# ROLE: CIP Platform Infrastructure with Immutable Audit Ledger & PgBouncer
 # -------------------------------------------------------------------------
 
 TARGET_ID=106
@@ -73,7 +73,7 @@ scrape_configs:
       - targets: ['192.168.2.57:9835']
 EOF
 
-# --- 4c. Docker Compose (Updated with Postgres Init Volume) ---
+# --- 4c. Docker Compose (Updated with Postgres Init Volume and PgBouncer) ---
 cat <<EOF > /tmp/cip-infra-compose.yml
 services:
   redis:
@@ -97,6 +97,30 @@ services:
       # AUTOMATIC SCHEMA INJECTION
       - ./init-audit-ledger.sql:/docker-entrypoint-initdb.d/init-audit-ledger.sql
     ports: ["5432:5432"]
+    security_opt:
+      - apparmor:unconfined
+    restart: always
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: cip_pgbouncer
+    environment:
+      DB_HOST: postgres
+      DB_USER: cip_user
+      DB_PASSWORD: cip_password
+      DB_NAME: cip_entities
+      # Transaction mode is required for high-throughput Python API/Worker queries
+      POOL_MODE: transaction
+      # Accept up to 2,000 incoming connections from Python workers
+      MAX_CLIENT_CONN: 2000
+      # Multiplex them down into just 40 actual connections to Postgres
+      DEFAULT_POOL_SIZE: 40
+      # psycopg2 relies on extra_float_digits, PgBouncer rejects this by default unless ignored
+      IGNORE_STARTUP_PARAMETERS: extra_float_digits
+    ports: 
+      - "6432:5432"
+    depends_on:
+      - postgres
     security_opt:
       - apparmor:unconfined
     restart: always
@@ -171,5 +195,5 @@ pct exec $TARGET_ID -- bash -c "cd /opt/cip-stack && docker compose up -d"
 echo "--- Cleanup ---"
 rm /tmp/prometheus.yml /tmp/cip-infra-compose.yml /tmp/init-audit-ledger.sql
 
-echo "Infrastructure deployed successfully with Audit Ledger!"
+echo "Infrastructure deployed successfully with Audit Ledger and PgBouncer!"
 pct exec $TARGET_ID -- ip -4 addr show eth0 | grep inet
