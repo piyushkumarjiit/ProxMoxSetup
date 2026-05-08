@@ -36,6 +36,8 @@ services:
       MAX_CLIENT_CONN: 2000
       DEFAULT_POOL_SIZE: 40
       IGNORE_STARTUP_PARAMETERS: extra_float_digits
+      # Fix for PostgreSQL 14+ password encryption mismatch
+      AUTH_TYPE: scram-sha-256
     ports: 
       - "6432:5432"
     depends_on:
